@@ -1,0 +1,65 @@
+name: Build DaliDist
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:        # manual "Run workflow" button in the Actions tab
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (VST3 + AU, Universal)
+            os: macos-14
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+            artifact: DaliDist-macOS
+          - name: Windows (VST3)
+            os: windows-latest
+            cmake_args: ""
+            artifact: DaliDist-Windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check source files
+        shell: bash
+        run: |
+          for f in DaliLookAndFeel.h DaliDistDSP.h PluginProcessor.h PluginProcessor.cpp PluginEditor.h PluginEditor.cpp; do
+            if [ ! -f "Source/$f" ]; then echo "::error::Missing Source/$f"; exit 1; fi
+          done
+
+      - name: Cache JUCE download
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-8.0.4-${{ runner.os }}
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Collect plugins
+        shell: bash
+        run: |
+          mkdir -p dist
+          ART=build/DaliDist_artefacts/Release
+          cp -R "$ART/VST3/DaliDist.vst3" dist/
+          if [ -d "$ART/AU/DaliDist.component" ]; then cp -R "$ART/AU/DaliDist.component" dist/; fi
+          if [ -d "$ART/Standalone" ]; then cp -R "$ART/Standalone/." dist/; fi
+          ls -la dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
