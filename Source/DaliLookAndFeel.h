@@ -126,14 +126,16 @@ public:
         auto r = b.getLocalBounds().toFloat().reduced (1.5f);
         const float corner = r.getHeight() * 0.28f;
         const bool on = b.getToggleState();
+        const bool hot = (bool) b.getProperties().getWithDefault ("hot", false);   // e.g. SOLO: brighter accent
+        const auto accent = hot ? DaliColours::neonHot : DaliColours::neon;
 
-        g.setColour (on ? DaliColours::neonDeep.withAlpha (0.35f) : DaliColours::panel);
+        g.setColour (on ? (hot ? DaliColours::neon.withAlpha (0.30f) : DaliColours::neonDeep.withAlpha (0.35f)) : DaliColours::panel);
         g.fillRoundedRectangle (r, corner);
 
         if (on)
         {
             juce::Path p; p.addRoundedRectangle (r, corner);
-            neonStroke (g, p, 1.2f, DaliColours::neon, 0.3f);
+            neonStroke (g, p, 1.2f, accent, hot ? 0.6f : 0.3f);
         }
         else
         {

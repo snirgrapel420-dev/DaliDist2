@@ -1,7 +1,7 @@
 /*
   ==============================================================================
     DaliDist — Dali Audio
-    Analog Color Box for Goa / Acid / Trance
+    Multiband Analog Color for Goa / Acid / Trance
   ==============================================================================
 */
 #pragma once
@@ -12,9 +12,10 @@
 
 namespace ParamIDs
 {
-    inline constexpr const char* drive     = "drive";
+    inline constexpr const char* master    = "master";
+    inline constexpr const char* xLow      = "xlow";
+    inline constexpr const char* xHigh     = "xhigh";
     inline constexpr const char* color     = "color";
-    inline constexpr const char* mode      = "mode";
     inline constexpr const char* talk      = "talk";
     inline constexpr const char* bite      = "bite";
     inline constexpr const char* subGuard  = "subguard";
@@ -23,6 +24,15 @@ namespace ParamIDs
     inline constexpr const char* output    = "output";
     inline constexpr const char* autoGain  = "autogain";
     inline constexpr const char* bypass    = "bypass";
+
+    // Per band: "low_drive", "mid_mode", "high_solo", ...
+    inline constexpr const char* bandPrefix[] = { "low", "mid", "high" };
+    inline juce::String band (int b, const char* suffix) { return juce::String (bandPrefix[b]) + "_" + suffix; }
+    inline constexpr const char* drive = "drive";
+    inline constexpr const char* mode  = "mode";
+    inline constexpr const char* level = "level";
+    inline constexpr const char* on    = "on";
+    inline constexpr const char* solo  = "solo";
 }
 
 class DaliDistAudioProcessor : public juce::AudioProcessor
@@ -64,9 +74,10 @@ public:
     // --- Meters for the editor (written on the audio thread, read by the UI)
     std::atomic<float> meterInDb       { -100.0f };
     std::atomic<float> meterOutDb      { -100.0f };
-    std::atomic<float> meterColorDb    { -100.0f };   // generated harmonics relative to input
+    std::atomic<float> meterColorDb    { -100.0f };   // total change relative to input
+    std::atomic<float> meterBandColorDb[dali::kNumBands];   // per band, set to -100 in the constructor
     std::atomic<float> meterAutoGainDb { 0.0f };
-    std::atomic<float> meterTalkHz     { 1000.0f };   // resonance the TALK circuit is following
+    std::atomic<float> meterTalkHz     { 1000.0f };   // resonance the MID band's TALK is following
     std::atomic<float> meterBite       { 0.0f };      // transient activity 0..~4
 
 private:
@@ -78,8 +89,12 @@ private:
     void delayDryInPlace (juce::AudioBuffer<float>& buffer);
 
     // Parameter pointers
-    std::atomic<float>* pDrive = nullptr; std::atomic<float>* pColor = nullptr;
-    std::atomic<float>* pMode = nullptr;  std::atomic<float>* pTalk = nullptr;
+    std::atomic<float>* pMaster = nullptr; std::atomic<float>* pColor = nullptr;
+    std::atomic<float>* pXLow = nullptr;   std::atomic<float>* pXHigh = nullptr;
+    std::atomic<float>* pTalk = nullptr;
+    struct BandPtrs { std::atomic<float>* drive = nullptr; std::atomic<float>* mode = nullptr; std::atomic<float>* level = nullptr;
+                      std::atomic<float>* on = nullptr; std::atomic<float>* solo = nullptr; };
+    std::array<BandPtrs, dali::kNumBands> pBand;
     std::atomic<float>* pBite = nullptr;  std::atomic<float>* pSubGuard = nullptr;
     std::atomic<float>* pDrift = nullptr; std::atomic<float>* pMix = nullptr;
     std::atomic<float>* pOutput = nullptr; std::atomic<float>* pAutoGain = nullptr;
@@ -95,9 +110,12 @@ private:
     std::array<std::vector<float>, kMaxChannels> dryRing;
     int ringWrite = 0;
 
-    // LR4 all-pass on the dry (LP + HP at SUB GUARD) so dry and wet are phase-coherent for the mix
-    std::array<dali::SVF, kMaxChannels> apL1, apL2, apH1, apH2;
-    float subSmoothed = 90.0f;
+    // Dry reference = AP_high AP_low (LP_sub + HP_sub): same phase as the three bands -> coherent mix.
+    // The LP_sub part is kept separate so it can follow the LOW band's solo gate.
+    std::array<dali::SVF, kMaxChannels> apL1, apL2, apH1, apH2;           // sub guard LR4 LP / HP
+    std::array<dali::SVF, kMaxChannels> subApLo, subApHi, hpApLo, hpApHi; // crossover all-passes
+    float subSmoothed = 90.0f, xlSmoothed = 250.0f, xhSmoothed = 3000.0f;
+    float lowGate = 1.0f, soloAmt = 0.0f, gateCoef = 0.0f;
 
     // Auto gain: loudness-weighted, slow, gated
     std::array<dali::OnePole, kMaxChannels> kwDryA, kwDryB, kwWetA, kwWetB;

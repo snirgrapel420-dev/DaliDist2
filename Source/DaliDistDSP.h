@@ -1,17 +1,25 @@
 /*
   ==============================================================================
-    DaliDist v2 — Analog Chain Engine
+    DaliDist v3 — Multiband Analog Chain Engine
     Dali Audio
 
     Pure C++ (no JUCE dependency) so the engine can be unit-tested on its own.
-    Runs at the OVERSAMPLED rate and outputs ONLY the color: P(HP(x)) - HP(x),
-    where HP is an LR4 high-pass at SUB GUARD. The processor builds
-        wet = AP(dry) + color  ==  LP(dry) + P(HP(dry))
-    with AP = LR4 all-pass (LP + HP) on the delayed dry, and mixes against AP(dry),
-    so parallel mix never notches at the crossover and the sub is never touched.
-    Drive 0 -> color is exactly 0.
+    Runs at the OVERSAMPLED rate and outputs ONLY the difference it makes.
 
-    Chain (per channel):
+    Split (per channel), all Linkwitz-Riley 24 dB/oct:
+        s    = HP_sub(x)                      everything below SUB GUARD stays clean
+        low  = AP_h( LP_l(s) )                AP_h keeps LOW in phase with MID+HIGH
+        mid  = LP_h( HP_l(s) )
+        high = HP_h( HP_l(s) )
+        low + mid + high == AP_h AP_l s       (flat magnitude, no notches)
+
+    Each band runs its own copy of the v2 analog chain with its own Mode / Drive / Level.
+    Output = sum_b( gate_b * band_out_b ) - sum_b( band_b )
+    The processor adds this to AP_h AP_l AP_sub(dry), computed on the latency-aligned dry, so
+        wet = AP_h AP_l LP_sub(dry) + sum_b gate_b * band_out_b
+    Drive 0 on every band (Level 0 dB, no solo) -> output is exactly 0.
+
+    Chain (per band, per channel):
       sub guard HP -> TALK (resonance-tracking pre-emphasis)
       -> Stage A (asymmetric triode, grid-conduction coupling-cap blocking)  [inverting]
       -> interstage coupling HP + treble loss
@@ -70,7 +78,7 @@ struct SVF
 {
     float a1 = 1, a2 = 0, a3 = 0, k = 1.41421356f;
     float ic1 = 0, ic2 = 0;
-    float lpOut = 0, hpOut = 0;
+    float lpOut = 0, hpOut = 0, apOut = 0;   // apOut: 2nd-order all-pass == LR4 LP + LR4 HP at Q 0.7071
 
     void set (float fc, float fs, float q) noexcept
     {
@@ -91,6 +99,7 @@ struct SVF
         ic2 = 2.0f * v2 - ic2;
         lpOut = v2;
         hpOut = v0 - k * v1 - v2;
+        apOut = v0 - 2.0f * k * v1;
     }
 };
 
@@ -227,16 +236,44 @@ inline Voicing voicingFor (Mode m) noexcept
     return voicingFor (Mode::Tube);
 }
 
+//==============================================================================
+// Parameters
+//==============================================================================
+constexpr int kNumBands = 3;
+enum Band : int { Low = 0, Mid = 1, High = 2 };
+
+struct BandParams
+{
+    Mode  mode  = Mode::Tube;
+    float drive = 0.15f;   // 0..1 (before the master Drive multiplier)
+    float level = 1.0f;    // linear band output level
+    bool  on    = true;    // false -> band passes clean
+    bool  solo  = false;
+};
+
 struct EngineParams
 {
-    Mode  mode     = Mode::Tube;
-    float drive    = 0.15f;   // 0..1
+    std::array<BandParams, kNumBands> band { { { Mode::Transformer, 0.12f, 1.0f, true, false },
+                                               { Mode::Tube,        0.20f, 1.0f, true, false },
+                                               { Mode::Tape,        0.12f, 1.0f, true, false } } };
+    float master   = 1.0f;    // 0..2, multiplies every band's drive
     float color    = 0.40f;   // 0 Warm .. 1 Excited
-    float talk     = 0.30f;   // 0..1  resonance-tracking emphasis
-    float bite     = 0.25f;   // 0..1  transient-driven attitude
-    float subGuard = 100.0f;  // Hz, everything below stays clean
+    float talk     = 0.30f;   // 0..1 resonance-tracking emphasis
+    float bite     = 0.25f;   // 0..1 transient-driven attitude
+    float subGuard = 90.0f;   // Hz, everything below stays clean
+    float xLow     = 250.0f;  // Hz, LOW | MID
+    float xHigh    = 3000.0f; // Hz, MID | HIGH
     float drift    = 0.30f;   // 0..1
+
+    bool anySolo() const noexcept { return band[0].solo || band[1].solo || band[2].solo; }
+    /** Gate for a band: 1 when audible, 0 when another band is soloed. */
+    float gateFor (int b) const noexcept { return (! anySolo() || band[(size_t) b].solo) ? 1.0f : 0.0f; }
 };
+
+/** Crossover limits shared by the engine and the processor so both always use the same values. */
+inline float clampXLow (float f) noexcept               { return std::clamp (f, 80.0f, 1000.0f); }
+inline float clampXHigh (float fHigh, float fLow) noexcept { return std::max (std::clamp (fHigh, 800.0f, 12000.0f), clampXLow (fLow) * 2.0f); }
+inline float clampSub (float f) noexcept                { return std::clamp (f, 20.0f, 300.0f); }
 
 //==============================================================================
 class ColorEngine
@@ -259,19 +296,22 @@ public:
         slowAtk = 1.0f - std::exp (-1.0f / (0.030f * fs));
         slowRel = 1.0f - std::exp (-1.0f / (0.250f * fs));
         biteSm  = 1.0f - std::exp (-1.0f / (0.002f * fs));
-        blockRec = 1.0f - std::exp (-1.0f / (0.180f * fs));   // coupling-cap recovery ~180 ms
+        blockRec = 1.0f - std::exp (-1.0f / (0.180f * fs));
 
         for (int c = 0; c < kMaxChannels; ++c)
         {
-            auto& ch = chans[(size_t) c];
-            for (int d = 0; d < 3; ++d)
-                ch.drift[(size_t) d].prepare (controlRate, 0xDA11u + 7919u * (uint32_t) (c * 3 + d));
-            XorShift tol (0xA0D10u + 104729u * (uint32_t) c);
-            ch.tolGain = tol.next(); ch.tolBias = tol.next(); ch.tolCut = tol.next();
-            ch.interHP.setCutoff (22.0f, fs);
-            ch.tLP.setCutoff (160.0f, fs);
-            ch.playLP.setCutoff (6000.0f, fs);
-            ch.dc.setCutoff (7.0f, fs);
+            for (int b = 0; b < kNumBands; ++b)
+            {
+                auto& ch = chains[(size_t) c][(size_t) b];
+                for (int d = 0; d < 3; ++d)
+                    ch.drift[(size_t) d].prepare (controlRate, 0xDA11u + 7919u * (uint32_t) (c * 9 + b * 3 + d));
+                XorShift tol (0xA0D10u + 104729u * (uint32_t) (c * 3 + b));   // each band = its own components
+                ch.tolGain = tol.next(); ch.tolBias = tol.next(); ch.tolCut = tol.next();
+                ch.interHP.setCutoff (22.0f, fs);
+                ch.tLP.setCutoff (160.0f, fs);
+                ch.playLP.setCutoff (6000.0f, fs);
+                ch.dc.setCutoff (7.0f, fs);
+            }
         }
         snapSmoothers();
         reset();
@@ -279,30 +319,46 @@ public:
 
     void reset()
     {
-        for (auto& ch : chans)
-        {
-            ch.s1a.reset(); ch.s1b.reset();
-            ch.talkPre.reset(); ch.talkDe.reset(); ch.pre.reset(); ch.de.reset();
-            ch.interHP.reset(); ch.interLP.reset(); ch.tLP.reset(); ch.playLP.reset(); ch.dc.reset(); ch.post.reset();
-            ch.cc = 0; ch.play = 0; ch.e0 = ch.e1 = 0; ch.prev = 0;
-            ch.envF = ch.envS = 0; ch.biteGain = 1;
-            ch.logTalkF = std::log (1000.0f);
-        }
+        for (auto& sp : splits)
+            for (auto* f : { &sp.sub1, &sp.sub2, &sp.l1a, &sp.l1b, &sp.h1a, &sp.h1b, &sp.ap2, &sp.l2a, &sp.l2b, &sp.h2a, &sp.h2b })
+                f->reset();
+
+        for (auto& perCh : chains)
+            for (auto& ch : perCh)
+            {
+                ch.talkPre.reset(); ch.talkDe.reset(); ch.pre.reset(); ch.de.reset();
+                ch.interHP.reset(); ch.interLP.reset(); ch.tLP.reset(); ch.playLP.reset(); ch.dc.reset(); ch.post.reset();
+                ch.cc = 0; ch.play = 0; ch.e0 = ch.e1 = 0; ch.prev = 0;
+                ch.envF = ch.envS = 0; ch.biteGain = 1;
+                ch.logTalkF = std::log (1000.0f);
+            }
         ctrlCounter = 0;
-        colorPow = inPow = 0;
+        inPow = 0;
+        bandColorPow.fill (0.0f);
     }
 
     void setParams (const EngineParams& p) noexcept { target = p; }
 
     void snapSmoothers() noexcept
     {
-        cur.drive = target.drive; cur.color = target.color; cur.talk = target.talk;
-        cur.bite = target.bite; cur.drift = target.drift; cur.logSub = std::log (target.subGuard);
-        cur.v = voicingFor (target.mode);
-        cur.logPreFz = std::log (cur.v.preFz); cur.logPreFp = std::log (cur.v.preFp);
+        cur.color = target.color; cur.talk = target.talk; cur.bite = target.bite; cur.drift = target.drift;
+        cur.logSub = std::log (clampSub (target.subGuard));
+        cur.logXL  = std::log (clampXLow (target.xLow));
+        cur.logXH  = std::log (clampXHigh (target.xHigh, target.xLow));
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            auto& bc = bandCur[(size_t) b];
+            const auto& tp = target.band[(size_t) b];
+            bc.drive = std::clamp (tp.drive * target.master, 0.0f, 1.0f);
+            bc.level = tp.level;
+            bc.act   = tp.on ? 1.0f : 0.0f;
+            bc.gate  = target.gateFor (b);
+            bc.v = voicingFor (tp.mode);
+            bc.logPreFz = std::log (bc.v.preFz); bc.logPreFp = std::log (bc.v.preFp);
+        }
     }
 
-    /** In place: input = oversampled dry, output = color only. */
+    /** In place: input = oversampled dry, output = the difference the plugin makes (see header). */
     void process (float* const* data, int numChannels, int numSamples) noexcept
     {
         const int nc = std::min (numChannels, numCh);
@@ -310,16 +366,49 @@ public:
         {
             if (ctrlCounter <= 0) { updateControl (nc); ctrlCounter = kControlInterval; }
             const int todo = std::min (ctrlCounter, numSamples - start);
+
             for (int c = 0; c < nc; ++c)
             {
-                auto& ch = chans[(size_t) c];
+                auto& sp = splits[(size_t) c];
+                auto& chs = chains[(size_t) c];
                 float* d = data[c] + start;
+
                 for (int i = 0; i < todo; ++i)
                 {
                     const float x = d[i];
-                    const float col = (colorScale > 0.0f) ? processSample (ch, x) * colorScale : 0.0f;
-                    inPow += x * x; colorPow += col * col;
-                    d[i] = col;
+
+                    // --- Split
+                    sp.sub1.tick (x);  sp.sub2.tick (sp.sub1.hpOut);
+                    const float s = sp.sub2.hpOut;
+
+                    sp.l1a.tick (s);   sp.l1b.tick (sp.l1a.lpOut);
+                    sp.h1a.tick (s);   sp.h1b.tick (sp.h1a.hpOut);
+                    const float rest = sp.h1b.hpOut;
+                    sp.ap2.tick (sp.l1b.lpOut);
+
+                    sp.l2a.tick (rest); sp.l2b.tick (sp.l2a.lpOut);
+                    sp.h2a.tick (rest); sp.h2b.tick (sp.h2a.hpOut);
+
+                    const float bands[kNumBands] = { sp.ap2.apOut, sp.l2b.lpOut, sp.h2b.hpOut };
+
+                    // --- Per band: v2 chain, level, on/off, solo gate
+                    float out = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b)
+                    {
+                        auto& ch = chs[(size_t) b];
+                        const float xb = bands[b];
+
+                        float y = xb;
+                        if (ch.colorScale > 0.0f && ch.act > 1.0e-4f)
+                            y += processChain (ch, xb) * ch.colorScale;
+
+                        const float fin  = xb + ch.act * (ch.level * y - xb);   // band ON/OFF crossfade
+                        const float diff = ch.gate * fin - xb;                  // solo gate
+                        bandColorPow[(size_t) b] += (fin - xb) * (fin - xb);
+                        out += diff;
+                    }
+                    inPow += x * x;
+                    d[i] = out;
                 }
             }
             ctrlCounter -= todo;
@@ -327,46 +416,69 @@ public:
         }
     }
 
-    float takeColorRatio() noexcept
+    /** How much each band is changing the sound, relative to the full input (for the UI glows). */
+    float takeBandColorRatio (int b) noexcept
     {
-        const float r = inPow > 1.0e-9f ? std::sqrt (colorPow / inPow) : 0.0f;
-        colorPow = inPow = 0;
+        const float r = inPow > 1.0e-9f ? std::sqrt (bandColorPow[(size_t) b] / inPow) : 0.0f;
+        bandColorPow[(size_t) b] = 0;
         return r;
     }
-    float getTalkFrequency() const noexcept { return std::exp (chans[0].logTalkF); }
-    float getBiteActivity() const noexcept  { return chans[0].biteGain - 1.0f; }
+    /** Call once per block after reading all bands. */
+    void endMeterBlock() noexcept { inPow = 0; }
+
+    float getTalkFrequency (int b = Mid) const noexcept { return std::exp (chains[0][(size_t) b].logTalkF); }
+    float getBiteActivity() const noexcept
+    {
+        float m = 0.0f;
+        for (const auto& ch : chains[0]) m = std::max (m, ch.biteGain - 1.0f);
+        return m;
+    }
 
 private:
-    struct Channel
+    struct Split
     {
-        SVF s1a, s1b;                      // sub guard LR4 high-pass
+        SVF sub1, sub2;            // sub guard LR4 HP
+        SVF l1a, l1b, h1a, h1b;    // LOW | MID crossover
+        SVF ap2;                   // LOW all-pass at MID | HIGH
+        SVF l2a, l2b, h2a, h2b;    // MID | HIGH crossover
+    };
+
+    /** One band on one channel: the complete v2 analog chain. */
+    struct Chain
+    {
         PeakEQ talkPre, talkDe;
         Shelf1 pre, de;
         OnePole interHP, interLP, tLP, playLP, dc;
         SVF post;
-        float cc = 0, play = 0;            // coupling-cap charge, hysteresis state
-        float e0 = 0, e1 = 0, prev = 0;    // resonance tracker
+        float cc = 0, play = 0;
+        float e0 = 0, e1 = 0, prev = 0;
         float envF = 0, envS = 0, biteGain = 1;
         float logTalkF = 6.9f;
         // control-rate
         float gA = 1, gB = 1, bA = 0, bB = 0, nA = 1, mk = 1, mkP = 1;
-        float sBT = 0, nBT = 1, sBA = 0, nBA = 1, sBP = 0, nBP = 1;   // stage B s(b), 1/s'(b)
+        float sBT = 0, nBT = 1, sBA = 0, nBA = 1, sBP = 0, nBP = 1;
         float wT = 1, wA = 0, wP = 0, hyst = 0, block = 0, tAmt = 0, kT = 1, bite = 0;
+        float colorScale = 0, level = 1, act = 1, gate = 1;
         bool usePre = false, useTalk = false;
         std::array<DriftSource, 3> drift;
         float tolGain = 0, tolBias = 0, tolCut = 0;
     };
 
+    struct BandCurrent
+    {
+        float drive = 0, level = 1, act = 1, gate = 1, logPreFz = 0, logPreFp = 0;
+        Voicing v {};
+    };
+
     struct Current
     {
-        float drive = 0, color = 0, talk = 0, bite = 0, drift = 0, logSub = 0, logPreFz = 0, logPreFp = 0;
-        Voicing v {};
+        float color = 0, talk = 0, bite = 0, drift = 0, logSub = 0, logXL = 0, logXH = 0;
     };
 
     static inline float algS (float v) noexcept { return v / std::sqrt (1.0f + v * v); }
     static inline float p4S  (float v) noexcept { const float v2 = v * v; return v / std::sqrt (std::sqrt (1.0f + v2 * v2)); }
 
-    inline float stageB (const Channel& ch, float v) const noexcept
+    inline float stageB (const Chain& ch, float v) const noexcept
     {
         const float vb = v + ch.bB;
         float y = 0.0f;
@@ -376,40 +488,31 @@ private:
         return y;
     }
 
-    inline float processSample (Channel& ch, float x) noexcept
+    /** v2 chain, unchanged apart from the sub guard now living in the split. Returns color of this band. */
+    inline float processChain (Chain& ch, float s) noexcept
     {
-        // Sub guard: only content above it is colored (the sub is rebuilt clean by the processor)
-        ch.s1a.tick (x); ch.s1b.tick (ch.s1a.hpOut);
-        const float s = ch.s1b.hpOut;
-
-        // Resonance tracker: RMS frequency sqrt(E[s'^2]/E[s^2]) follows filter sweeps / formants
         const float ds = s - ch.prev; ch.prev = s;
         ch.e0 += trackCoef * (s * s - ch.e0);
         ch.e1 += trackCoef * (ds * ds - ch.e1);
 
-        // BITE: fast vs slow envelope -> transient detector
         const float a = std::abs (s);
         ch.envF += (a > ch.envF ? fastAtk : fastRel) * (a - ch.envF);
         ch.envS += (a > ch.envS ? slowAtk : slowRel) * (a - ch.envS);
         const float trans = std::clamp (ch.envF / (ch.envS + 1.0e-5f) - 1.15f, 0.0f, 2.0f);
         ch.biteGain += biteSm * ((1.0f + ch.bite * 2.2f * trans) - ch.biteGain);
 
-        // --- pre-emphasis (TALK, tape)
         float u = ch.useTalk ? ch.talkPre.process (s) : s;
         if (ch.usePre) u = ch.pre.process (u);
 
-        // --- Stage A: asymmetric triode with grid-conduction blocking (inverting)
         const float vA = ch.gA * u + ch.cc;
         const float yA = -(std::tanh (vA + ch.bA) - std::tanh (ch.cc + ch.bA)) * ch.nA;
-        const float over = vA + ch.bA - 0.55f;               // grid starts conducting
-        if (over > 0.0f) ch.cc -= ch.block * 0.02f * over / (1.0f + over);   // coupling cap charges (grid current saturates)
-        ch.cc = std::max (ch.cc, -0.9f);                                        // bias can shift, never gate the stage
-        ch.cc -= blockRec * ch.cc;                           // ...and recovers: bloom / breathing
+        const float over = vA + ch.bA - 0.55f;
+        if (over > 0.0f) ch.cc -= ch.block * 0.02f * over / (1.0f + over);
+        ch.cc = std::max (ch.cc, -0.9f);
+        ch.cc -= blockRec * ch.cc;
 
-        // --- Interstage: coupling HP + treble loss
         float w = ch.interLP.lp (ch.interHP.hp (yA));
 
-        // --- Stage B (inverting back), BITE pushes it harder on attacks
         const float gBd = ch.gB * ch.biteGain;
         float vB = gBd * w;
         if (ch.hyst > 1.0e-4f)
@@ -419,10 +522,8 @@ private:
             if (dl > W) ch.play = vB - W; else if (dl < -W) ch.play = vB + W;
             vB += ch.hyst * (vB * vB / (1.0f + vB * vB)) * (ch.playLP.lp (ch.play) - vB);
         }
-        // Makeup: full normalisation at low drive, partial at high drive -> sustain/density like a real amp
         float y = -stageB (ch, vB) * ch.mk / (1.0f + ch.mkP * (ch.biteGain - 1.0f));
 
-        // --- Output transformer: LF flux saturation
         if (ch.tAmt > 1.0e-4f)
         {
             const float yl = ch.tLP.lp (y);
@@ -432,7 +533,7 @@ private:
         if (ch.usePre)  y = ch.de.process (y);
         if (ch.useTalk) y = ch.talkDe.process (y);
 
-        ch.post.tick (y);                                    // transformer HF resonance / anti-harshness
+        ch.post.tick (y);
         float col = ch.post.lpOut - s;
         col -= ch.dc.lp (col);
         return col;
@@ -440,103 +541,137 @@ private:
 
     template <typename T> inline void approach (T& c, T t) noexcept { c += (t - c) * ctrlCoef; }
 
+    static void approachVoicing (Voicing& v, const Voicing& tv, float k) noexcept
+    {
+        auto ap = [k] (float& c, float t) { c += (t - c) * k; };
+        ap (v.bA, tv.bA); ap (v.bB, tv.bB); ap (v.splitA, tv.splitA); ap (v.block, tv.block);
+        ap (v.fInter, tv.fInter); ap (v.wT, tv.wT); ap (v.wA, tv.wA); ap (v.wP, tv.wP);
+        ap (v.hyst, tv.hyst); ap (v.tAmt, tv.tAmt); ap (v.fPost, tv.fPost);
+        ap (v.driveScale, tv.driveScale); ap (v.talkBase, tv.talkBase); ap (v.biteBase, tv.biteBase);
+    }
+
     void updateControl (int nc) noexcept
     {
-        approach (cur.drive, target.drive); approach (cur.color, target.color);
-        approach (cur.talk, target.talk);   approach (cur.bite, target.bite);
-        approach (cur.drift, target.drift);
-        approach (cur.logSub, std::log (std::clamp (target.subGuard, 30.0f, 400.0f)));
-
-        const Voicing tv = voicingFor (target.mode);
-        auto& v = cur.v;
-        approach (v.bA, tv.bA); approach (v.bB, tv.bB); approach (v.splitA, tv.splitA); approach (v.block, tv.block);
-        approach (v.fInter, tv.fInter); approach (v.wT, tv.wT); approach (v.wA, tv.wA); approach (v.wP, tv.wP);
-        approach (v.hyst, tv.hyst); approach (v.tAmt, tv.tAmt); approach (v.fPost, tv.fPost);
-        approach (v.driveScale, tv.driveScale); approach (v.talkBase, tv.talkBase); approach (v.biteBase, tv.biteBase);
-        approach (cur.logPreFz, std::log (tv.preFz)); approach (cur.logPreFp, std::log (tv.preFp));
-
-        const float d = std::clamp (cur.drive, 0.0f, 1.0f);
-        colorScale = std::min (1.0f, d / 0.10f);                 // Drive 0 -> exactly nothing
-        const float driveDb = -4.0f + 40.0f * std::pow (d, 1.2f);   // 5-20 % = color, 30 %+ = drive, 70 %+ = attitude
-        const float mkP = 1.0f - 0.55f * d;
-        constexpr float kRef = 1.8f;
-
-        // COLOR: Warm -> Rich -> Open -> Excited
-        const float c = std::clamp (cur.color, 0.0f, 1.0f);
-        const float biasMul  = lerp (1.5f, 0.6f, c);
-        const float interMul = 0.6f * std::pow (2.7f, c);
-        const float postMul  = lerp (0.85f, 1.1f, c);
-
-        const float talk = std::clamp (cur.talk + v.talkBase * (0.3f + 0.7f * cur.talk), 0.0f, 1.0f);
-        const float talkDb = 13.0f * talk;
-        const float bite = std::clamp (cur.bite + v.biteBase * (0.3f + 0.7f * cur.bite), 0.0f, 1.0f);
+        // --- globals
+        approach (cur.color, target.color); approach (cur.talk, target.talk);
+        approach (cur.bite, target.bite);   approach (cur.drift, target.drift);
+        approach (cur.logSub, std::log (clampSub (target.subGuard)));
+        approach (cur.logXL,  std::log (clampXLow (target.xLow)));
+        approach (cur.logXH,  std::log (clampXHigh (target.xHigh, target.xLow)));
 
         const float fSub = std::exp (cur.logSub);
-        const float fz = std::exp (cur.logPreFz), fp = std::exp (cur.logPreFp);
-        const bool usePre = std::abs (cur.logPreFz - cur.logPreFp) > 0.01f;
-
-        for (int ci = 0; ci < nc; ++ci)
+        const float xl = std::exp (cur.logXL);
+        const float xh = std::max (std::exp (cur.logXH), xl * 2.0f);
+        for (int c = 0; c < nc; ++c)
         {
-            auto& ch = chans[(size_t) ci];
-            ch.s1a.set (fSub, fs, 0.70710678f); ch.s1b.set (fSub, fs, 0.70710678f);
+            auto& sp = splits[(size_t) c];
+            sp.sub1.set (fSub, fs, 0.70710678f); sp.sub2.set (fSub, fs, 0.70710678f);
+            for (auto* f : { &sp.l1a, &sp.l1b, &sp.h1a, &sp.h1b }) f->set (xl, fs, 0.70710678f);
+            for (auto* f : { &sp.ap2, &sp.l2a, &sp.l2b, &sp.h2a, &sp.h2b }) f->set (xh, fs, 0.70710678f);
+        }
 
-            const float da = cur.drift;
-            const float dG = ch.drift[0].tick(), dB = ch.drift[1].tick(), dC = ch.drift[2].tick();
-            const float gDrift = dbToGain (da * (0.30f * dG + 0.18f * ch.tolGain));
-            const float bDrift = da * (0.035f * dB + 0.018f * ch.tolBias);
-            const float cDrift = 1.0f + da * (0.06f * dC + 0.03f * ch.tolCut);
+        const float col = std::clamp (cur.color, 0.0f, 1.0f);
+        const float biasMul  = lerp (1.5f, 0.6f, col);
+        const float interMul = 0.6f * std::pow (2.7f, col);
+        const float postMul  = lerp (0.85f, 1.1f, col);
+        constexpr float kRef = 1.8f;
 
-            ch.gA = dbToGain (driveDb * v.splitA) * kRef * v.driveScale * gDrift;
-            ch.gB = dbToGain (driveDb * (1.0f - v.splitA));
-            ch.mkP = mkP;
-            ch.mk = std::pow (ch.gA * ch.gB, -mkP);
-            ch.bA = std::clamp (v.bA * biasMul + bDrift, -0.8f, 0.8f);
-            ch.bB = std::clamp (v.bB * biasMul - 0.5f * bDrift, -0.8f, 0.8f);
-            const float tA = std::tanh (ch.bA);
-            ch.nA = 1.0f / (1.0f - tA * tA);
-            const float bb = ch.bB, tb = std::tanh (bb), b4 = bb * bb * bb * bb;
-            ch.sBT = tb;         ch.nBT = 1.0f / (1.0f - tb * tb);
-            ch.sBA = algS (bb);  ch.nBA = std::pow (1.0f + bb * bb, 1.5f);
-            ch.sBP = p4S (bb);   ch.nBP = std::pow (1.0f + b4, 1.25f);
-            ch.wT = v.wT; ch.wA = v.wA; ch.wP = v.wP;
-            ch.hyst = v.hyst * (1.0f + 0.25f * da * dB);
-            ch.block = v.block;
-            ch.tAmt = v.tAmt;
-            ch.kT = 1.0f + 5.0f * d;
-            ch.bite = bite;
+        // --- bands
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            auto& bc = bandCur[(size_t) b];
+            const auto& tp = target.band[(size_t) b];
+            approach (bc.drive, std::clamp (tp.drive * target.master, 0.0f, 1.0f));
+            approach (bc.level, tp.level);
+            approach (bc.act,  tp.on ? 1.0f : 0.0f);
+            approach (bc.gate, target.gateFor (b));
+            const Voicing tv = voicingFor (tp.mode);
+            approachVoicing (bc.v, tv, ctrlCoef);
+            approach (bc.logPreFz, std::log (tv.preFz)); approach (bc.logPreFp, std::log (tv.preFp));
+            const auto& v = bc.v;
 
-            ch.interLP.setCutoff (std::clamp (v.fInter * interMul * cDrift, 2500.0f, 22000.0f), fs);
-            ch.post.set (std::clamp (v.fPost * postMul * cDrift, 9000.0f, 22000.0f), fs, 0.8f);
+            const float d = std::clamp (bc.drive, 0.0f, 1.0f);
+            const float colorScale = std::min (1.0f, d / 0.10f);
+            const float driveDb = -4.0f + 40.0f * std::pow (d, 1.2f);
+            const float mkP = 1.0f - 0.55f * d;
 
-            ch.usePre = usePre;
-            if (usePre) { ch.pre.design (fz, fp, fs, false); ch.de.design (fz, fp, fs, true); }
+            const float talk = std::clamp (cur.talk + v.talkBase * (0.3f + 0.7f * cur.talk), 0.0f, 1.0f);
+            const float talkDb = 13.0f * talk;
+            const float bite = std::clamp (cur.bite + v.biteBase * (0.3f + 0.7f * cur.bite), 0.0f, 1.0f);
 
-            // TALK: follow the resonance, emphasise it into the drive, restore after
-            ch.useTalk = talkDb > 0.05f;
-            if (ch.e0 > 1.0e-10f)
+            const float fz = std::exp (bc.logPreFz), fp = std::exp (bc.logPreFp);
+            const bool usePre = std::abs (bc.logPreFz - bc.logPreFp) > 0.01f;
+
+            // TALK tracks inside the band it lives in
+            const float talkLo = (b == Low) ? 40.0f : (b == Mid ? xl : xh);
+            const float talkHi = (b == Low) ? xl * 1.5f : (b == Mid ? xh : 12000.0f);
+
+            for (int c = 0; c < nc; ++c)
             {
-                const float ratio = std::min (4.0f, ch.e1 / ch.e0);
-                const float w = 2.0f * std::asin (std::min (1.0f, std::sqrt (ratio) * 0.5f));
-                const float f = std::clamp (w * fs / (2.0f * kPi), 180.0f, 5000.0f);
-                ch.logTalkF += talkCoef * (std::log (f) - ch.logTalkF);
-            }
-            if (ch.useTalk)
-            {
-                const float ft = std::exp (ch.logTalkF);
-                ch.talkPre.set (ft, fs, 1.3f, talkDb, false);
-                ch.talkDe.set  (ft, fs, 1.3f, talkDb, true);
+                auto& ch = chains[(size_t) c][(size_t) b];
+                ch.colorScale = colorScale;
+                ch.level = bc.level; ch.act = bc.act; ch.gate = bc.gate;
+                if (colorScale <= 0.0f || bc.act <= 1.0e-4f) continue;   // nothing to compute
+
+                const float da = cur.drift;
+                const float dG = ch.drift[0].tick(), dB = ch.drift[1].tick(), dC = ch.drift[2].tick();
+                const float gDrift = dbToGain (da * (0.30f * dG + 0.18f * ch.tolGain));
+                const float bDrift = da * (0.035f * dB + 0.018f * ch.tolBias);
+                const float cDrift = 1.0f + da * (0.06f * dC + 0.03f * ch.tolCut);
+
+                ch.gA = dbToGain (driveDb * v.splitA) * kRef * v.driveScale * gDrift;
+                ch.gB = dbToGain (driveDb * (1.0f - v.splitA));
+                ch.mkP = mkP;
+                ch.mk = std::pow (ch.gA * ch.gB, -mkP);
+                ch.bA = std::clamp (v.bA * biasMul + bDrift, -0.8f, 0.8f);
+                ch.bB = std::clamp (v.bB * biasMul - 0.5f * bDrift, -0.8f, 0.8f);
+                const float tA = std::tanh (ch.bA);
+                ch.nA = 1.0f / (1.0f - tA * tA);
+                const float bb = ch.bB, tb = std::tanh (bb), b4 = bb * bb * bb * bb;
+                ch.sBT = tb;         ch.nBT = 1.0f / (1.0f - tb * tb);
+                ch.sBA = algS (bb);  ch.nBA = std::pow (1.0f + bb * bb, 1.5f);
+                ch.sBP = p4S (bb);   ch.nBP = std::pow (1.0f + b4, 1.25f);
+                ch.wT = v.wT; ch.wA = v.wA; ch.wP = v.wP;
+                ch.hyst = v.hyst * (1.0f + 0.25f * da * dB);
+                ch.block = v.block;
+                ch.tAmt = v.tAmt;
+                ch.kT = 1.0f + 5.0f * d;
+                ch.bite = bite;
+
+                ch.interLP.setCutoff (std::clamp (v.fInter * interMul * cDrift, 2500.0f, 22000.0f), fs);
+                ch.post.set (std::clamp (v.fPost * postMul * cDrift, 9000.0f, 22000.0f), fs, 0.8f);
+
+                ch.usePre = usePre;
+                if (usePre) { ch.pre.design (fz, fp, fs, false); ch.de.design (fz, fp, fs, true); }
+
+                ch.useTalk = talkDb > 0.05f;
+                if (ch.e0 > 1.0e-10f)
+                {
+                    const float ratio = std::min (4.0f, ch.e1 / ch.e0);
+                    const float w = 2.0f * std::asin (std::min (1.0f, std::sqrt (ratio) * 0.5f));
+                    const float f = std::clamp (w * fs / (2.0f * kPi), std::max (40.0f, talkLo), std::max (talkLo + 1.0f, talkHi));
+                    ch.logTalkF += talkCoef * (std::log (f) - ch.logTalkF);
+                }
+                if (ch.useTalk)
+                {
+                    const float ft = std::exp (ch.logTalkF);
+                    ch.talkPre.set (ft, fs, 1.3f, talkDb, false);
+                    ch.talkDe.set  (ft, fs, 1.3f, talkDb, true);
+                }
             }
         }
     }
 
     float fs = 192000.0f, controlRate = 12000.0f, ctrlCoef = 0.1f, talkCoef = 0.1f;
     float trackCoef = 0, fastAtk = 0, fastRel = 0, slowAtk = 0, slowRel = 0, biteSm = 0, blockRec = 0;
-    float colorScale = 0;
     int numCh = 2, ctrlCounter = 0;
-    std::array<Channel, kMaxChannels> chans;
+    std::array<Split, kMaxChannels> splits;
+    std::array<std::array<Chain, kNumBands>, kMaxChannels> chains;
+    std::array<BandCurrent, kNumBands> bandCur;
     EngineParams target;
     Current cur;
-    float colorPow = 0, inPow = 0;
+    float inPow = 0;
+    std::array<float, kNumBands> bandColorPow {};
 };
 
 } // namespace dali

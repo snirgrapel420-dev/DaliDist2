@@ -1,15 +1,16 @@
 /*
   ==============================================================================
-    DaliDist — Dali Audio
+    DaliDist v3 — Dali Audio (multiband)
 
     Signal flow
     -----------
-      in ──┬─► [integer delay = OS latency] ─┬──────────────────────────────────────► bypass (raw, exact)
-           │                                 └─► LR4 all-pass (sub guard) = A ──┬──► mix ─► out trim ─► out
-           └─► 4x up ─► ColorEngine (color only) ─► 4x down ─► A + color ─► auto gain = wet ┘
+      in ──┬─► [integer delay = OS latency] ─┬───────────────────────────────────────────► bypass (raw, exact)
+           │                                 └─► D = AP_h AP_l (LP_sub + HP_sub) ──┬──► mix ─► out trim ─► out
+           └─► 4x up ─► split LOW | MID | HIGH ─► 3 x analog chain ─► 4x down ─► D + Δ ─► auto gain = wet ┘
 
-    wet = A + color = LP(dry) + Chain(HP(dry)): the sub below SUB GUARD is never colored,
-    and because dry and wet share the same all-pass, the parallel mix is phase-coherent.
+    The three bands are Linkwitz-Riley 24 dB/oct; D is the exact all-pass they sum to, computed on the
+    latency-aligned dry, so the parallel mix is phase-coherent and a clean band is bit-exact.
+    Below SUB GUARD nothing is ever colored.
   ==============================================================================
 */
 #include "PluginProcessor.h"
@@ -34,17 +35,40 @@ juce::AudioProcessorValueTreeState::ParameterLayout DaliDistAudioProcessor::crea
 
     auto pct = [] (float v, int) { return String (juce::roundToInt (v)) + "%"; };
 
-    // Drive: skewed so the 5–20 % sweet spot gets most of the knob travel
-    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::drive, 1 }, "Drive",
-        NormalisableRange<float> (0.0f, 100.0f, 0.01f, 0.55f), 15.0f,
-        AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
+    auto dbText = [] (float v, int) { return (v > 0.05f ? "+" : "") + String (v, 1) + " dB"; };
+    auto hz = [] (float v, int) { return v < 1000.0f ? String (juce::roundToInt (v)) + " Hz" : String (v / 1000.0f, 2) + " kHz"; };
+    const StringArray modes { "Tube", "Transformer", "Tape", "Console", "Acid" };
+
+    // --- Per band. Drive skewed so the 5–20 % sweet spot gets most of the knob travel.
+    const char* bandTitles[] = { "Low", "Mid", "High" };
+    const float driveDefaults[] = { 12.0f, 20.0f, 12.0f };
+    const int   modeDefaults[]  = { 1, 0, 2 };    // Transformer, Tube, Tape
+    for (int b = 0; b < dali::kNumBands; ++b)
+    {
+        const String t (bandTitles[b]);
+        layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::band (b, ParamIDs::drive), 1 }, t + " Drive",
+            NormalisableRange<float> (0.0f, 100.0f, 0.01f, 0.55f), driveDefaults[b], AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
+        layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamIDs::band (b, ParamIDs::mode), 1 }, t + " Mode", modes, modeDefaults[b]));
+        layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::band (b, ParamIDs::level), 1 }, t + " Level",
+            NormalisableRange<float> (-12.0f, 12.0f, 0.01f), 0.0f, AudioParameterFloatAttributes().withStringFromValueFunction (dbText)));
+        layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::band (b, ParamIDs::on), 1 }, t + " On", true));
+        layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::band (b, ParamIDs::solo), 1 }, t + " Solo", false));
+    }
+
+    // --- Global
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::master, 1 }, "Drive",
+        NormalisableRange<float> (0.0f, 200.0f, 0.01f), 100.0f, AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
+
+    NormalisableRange<float> xlRange (80.0f, 1000.0f, 1.0f);   xlRange.setSkewForCentre (250.0f);
+    NormalisableRange<float> xhRange (800.0f, 12000.0f, 1.0f); xhRange.setSkewForCentre (3000.0f);
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::xLow, 1 }, "Low | Mid",
+        xlRange, 250.0f, AudioParameterFloatAttributes().withStringFromValueFunction (hz)));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::xHigh, 1 }, "Mid | High",
+        xhRange, 3000.0f, AudioParameterFloatAttributes().withStringFromValueFunction (hz)));
 
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::color, 1 }, "Color",
         NormalisableRange<float> (0.0f, 100.0f, 0.01f), 40.0f,
         AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return colorName (v); })));
-
-    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamIDs::mode, 1 }, "Mode",
-        StringArray { "Tube", "Transformer", "Tape", "Console", "Acid" }, 0));
 
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::talk, 1 }, "Talk",
         NormalisableRange<float> (0.0f, 100.0f, 0.01f), 30.0f, AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
@@ -52,7 +76,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DaliDistAudioProcessor::crea
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::bite, 1 }, "Bite",
         NormalisableRange<float> (0.0f, 100.0f, 0.01f), 25.0f, AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
 
-    NormalisableRange<float> subRange (30.0f, 300.0f, 1.0f); subRange.setSkewForCentre (90.0f);
+    NormalisableRange<float> subRange (20.0f, 300.0f, 1.0f); subRange.setSkewForCentre (90.0f);
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::subGuard, 1 }, "Sub Guard",
         subRange, 90.0f, AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return String (juce::roundToInt (v)) + " Hz"; })));
 
@@ -79,9 +103,10 @@ DaliDistAudioProcessor::DaliDistAudioProcessor()
                         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "DaliDistState", createParameterLayout())
 {
-    pDrive     = apvts.getRawParameterValue (ParamIDs::drive);
+    pMaster    = apvts.getRawParameterValue (ParamIDs::master);
+    pXLow      = apvts.getRawParameterValue (ParamIDs::xLow);
+    pXHigh     = apvts.getRawParameterValue (ParamIDs::xHigh);
     pColor     = apvts.getRawParameterValue (ParamIDs::color);
-    pMode      = apvts.getRawParameterValue (ParamIDs::mode);
     pTalk      = apvts.getRawParameterValue (ParamIDs::talk);
     pBite      = apvts.getRawParameterValue (ParamIDs::bite);
     pSubGuard  = apvts.getRawParameterValue (ParamIDs::subGuard);
@@ -90,6 +115,17 @@ DaliDistAudioProcessor::DaliDistAudioProcessor()
     pOutput    = apvts.getRawParameterValue (ParamIDs::output);
     pAutoGain  = apvts.getRawParameterValue (ParamIDs::autoGain);
     pBypass    = apvts.getRawParameterValue (ParamIDs::bypass);
+
+    for (int b = 0; b < dali::kNumBands; ++b)
+    {
+        auto& bp = pBand[(size_t) b];
+        bp.drive = apvts.getRawParameterValue (ParamIDs::band (b, ParamIDs::drive));
+        bp.mode  = apvts.getRawParameterValue (ParamIDs::band (b, ParamIDs::mode));
+        bp.level = apvts.getRawParameterValue (ParamIDs::band (b, ParamIDs::level));
+        bp.on    = apvts.getRawParameterValue (ParamIDs::band (b, ParamIDs::on));
+        bp.solo  = apvts.getRawParameterValue (ParamIDs::band (b, ParamIDs::solo));
+        meterBandColorDb[b].store (-100.0f);
+    }
 }
 
 bool DaliDistAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -108,12 +144,23 @@ juce::AudioProcessorParameter* DaliDistAudioProcessor::getBypassParameter() cons
 dali::EngineParams DaliDistAudioProcessor::readEngineParams() const
 {
     dali::EngineParams p;
-    p.mode     = (dali::Mode) juce::jlimit (0, (int) dali::Mode::NumModes - 1, (int) pMode->load());
-    p.drive    = pDrive->load() * 0.01f;
+    for (int b = 0; b < dali::kNumBands; ++b)
+    {
+        const auto& bp = pBand[(size_t) b];
+        auto& band = p.band[(size_t) b];
+        band.mode  = (dali::Mode) juce::jlimit (0, (int) dali::Mode::NumModes - 1, (int) bp.mode->load());
+        band.drive = bp.drive->load() * 0.01f;
+        band.level = juce::Decibels::decibelsToGain (bp.level->load());
+        band.on    = bp.on->load() > 0.5f;
+        band.solo  = bp.solo->load() > 0.5f;
+    }
+    p.master   = pMaster->load() * 0.01f;
     p.color    = pColor->load() * 0.01f;
     p.talk     = pTalk->load() * 0.01f;
     p.bite     = pBite->load() * 0.01f;
     p.subGuard = pSubGuard->load();
+    p.xLow     = pXLow->load();
+    p.xHigh    = pXHigh->load();
     p.drift    = pDrift->load() * 0.01f;
     return p;
 }
@@ -142,7 +189,9 @@ void DaliDistAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     ringWrite = 0;
 
     const float fs = (float) sampleRate;
-    subSmoothed = pSubGuard->load();
+    subSmoothed = dali::clampSub (pSubGuard->load());
+    xlSmoothed  = dali::clampXLow (pXLow->load());
+    xhSmoothed  = dali::clampXHigh (pXHigh->load(), pXLow->load());
     for (int c = 0; c < kMaxChannels; ++c)
     {
         for (auto* f : { &apL1[(size_t) c], &apL2[(size_t) c], &apH1[(size_t) c], &apH2[(size_t) c] })
@@ -150,7 +199,15 @@ void DaliDistAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
             f->set (subSmoothed, fs, 0.70710678f);
             f->reset();
         }
+        for (auto* f : { &subApLo[(size_t) c], &hpApLo[(size_t) c] }) { f->set (xlSmoothed, fs, 0.70710678f); f->reset(); }
+        for (auto* f : { &subApHi[(size_t) c], &hpApHi[(size_t) c] }) { f->set (xhSmoothed, fs, 0.70710678f); f->reset(); }
     }
+    {
+        const auto p = readEngineParams();
+        lowGate = p.gateFor (dali::Low);
+        soloAmt = p.anySolo() ? 1.0f : 0.0f;
+    }
+    gateCoef = 1.0f - std::exp (-1.0f / (0.030f * fs));   // same 30 ms glide as the engine's band gates
     for (int c = 0; c < kMaxChannels; ++c)
     {
         kwDryA[(size_t) c].setCutoff (60.0f, fs);   kwWetA[(size_t) c].setCutoff (60.0f, fs);
@@ -178,12 +235,20 @@ void DaliDistAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     engine.setParams (readEngineParams());
 
-    // All-pass tracks SUB GUARD with the same ~30 ms glide the engine uses
+    // Dry all-passes follow SUB GUARD and the crossovers with the same ~30 ms glide the engine uses
     const float sr = (float) getSampleRate();
-    subSmoothed += (pSubGuard->load() - subSmoothed) * (1.0f - std::exp (-(float) n / (0.03f * sr)));
+    const float k = 1.0f - std::exp (-(float) n / (0.03f * sr));
+    subSmoothed = std::exp (std::log (subSmoothed) + k * (std::log (dali::clampSub (pSubGuard->load())) - std::log (subSmoothed)));
+    xlSmoothed  = std::exp (std::log (xlSmoothed)  + k * (std::log (dali::clampXLow (pXLow->load())) - std::log (xlSmoothed)));
+    xhSmoothed  = std::exp (std::log (xhSmoothed)  + k * (std::log (dali::clampXHigh (pXHigh->load(), pXLow->load())) - std::log (xhSmoothed)));
+    const float xh = juce::jmax (xhSmoothed, xlSmoothed * 2.0f);
     for (int c = 0; c < numChannels; ++c)
+    {
         for (auto* f : { &apL1[(size_t) c], &apL2[(size_t) c], &apH1[(size_t) c], &apH2[(size_t) c] })
             f->set (subSmoothed, sr, 0.70710678f);
+        for (auto* f : { &subApLo[(size_t) c], &hpApLo[(size_t) c] }) f->set (xlSmoothed, sr, 0.70710678f);
+        for (auto* f : { &subApHi[(size_t) c], &hpApHi[(size_t) c] }) f->set (xh, sr, 0.70710678f);
+    }
 
     mixSm.setTargetValue (pMix->load() * 0.01f);
     outSm.setTargetValue (juce::Decibels::decibelsToGain (pOutput->load()));
@@ -202,9 +267,17 @@ void DaliDistAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     meterInDb.store (juce::Decibels::gainToDecibels (inPeak, -100.0f));
     meterOutDb.store (juce::Decibels::gainToDecibels (outPeak, -100.0f));
-    meterColorDb.store (juce::Decibels::gainToDecibels (engine.takeColorRatio(), -100.0f));
+    float totalPow = 0.0f;
+    for (int b = 0; b < dali::kNumBands; ++b)
+    {
+        const float r = engine.takeBandColorRatio (b);
+        totalPow += r * r;
+        meterBandColorDb[b].store (juce::Decibels::gainToDecibels (r, -100.0f));
+    }
+    engine.endMeterBlock();
+    meterColorDb.store (juce::Decibels::gainToDecibels (std::sqrt (totalPow), -100.0f));
     meterAutoGainDb.store (juce::Decibels::gainToDecibels (agGain, -100.0f));
-    meterTalkHz.store (engine.getTalkFrequency());
+    meterTalkHz.store (engine.getTalkFrequency (dali::Mid));
     meterBite.store (engine.getBiteActivity());
 }
 
@@ -224,8 +297,11 @@ void DaliDistAudioProcessor::processChunk (juce::AudioBuffer<float>& buffer, int
 
     oversampler->processSamplesDown (colorBlock);
 
-    // 2) Per sample: aligned dry, all-passed dry A, wet = A + color, auto gain, mix, output, bypass
+    // 2) Per sample: aligned dry, all-passed dry D, wet = D + Δ, auto gain, mix, output, bypass
     const bool autoGainOn = pAutoGain->load() > 0.5f;
+    const auto gates = readEngineParams();
+    const float lowGateTarget = gates.gateFor (dali::Low);
+    const float soloTarget    = gates.anySolo() ? 1.0f : 0.0f;
     float* io[kMaxChannels]        = { nullptr, nullptr };
     const float* col[kMaxChannels] = { nullptr, nullptr };
     for (int c = 0; c < numChannels; ++c)
@@ -253,8 +329,12 @@ void DaliDistAudioProcessor::processChunk (juce::AudioBuffer<float>& buffer, int
             auto& h1 = apH1[(size_t) c]; auto& h2 = apH2[(size_t) c];
             l1.tick (dry[c]); l2.tick (l1.lpOut);
             h1.tick (dry[c]); h2.tick (h1.hpOut);
-            ap[c]  = l2.lpOut + h2.hpOut;
-            wet[c] = ap[c] + col[c][i];
+            auto& sLo = subApLo[(size_t) c]; auto& sHi = subApHi[(size_t) c];
+            auto& hLo = hpApLo[(size_t) c];  auto& hHi = hpApHi[(size_t) c];
+            sLo.tick (l2.lpOut); sHi.tick (sLo.apOut);     // sub part through both crossover all-passes
+            hLo.tick (h2.hpOut); hHi.tick (hLo.apOut);     // band part, same all-passes
+            ap[c]  = sHi.apOut + hHi.apOut;
+            wet[c] = lowGate * sHi.apOut + hHi.apOut + col[c][i];   // the sub follows the LOW band's solo
 
             // Simple loudness weighting (LF roll-off + presence lift) for level matching
             const float dA = kwDryA[(size_t) c].hp (ap[c]);
@@ -268,14 +348,18 @@ void DaliDistAudioProcessor::processChunk (juce::AudioBuffer<float>& buffer, int
         msDry += msCoef * (pDry * invCh - msDry);
         msWet += msCoef * (pWet * invCh - msWet);
 
-        float agTarget = agGain;                           // hold during silence (no pumping on tails)
+        lowGate += gateCoef * (lowGateTarget - lowGate);
+        soloAmt += gateCoef * (soloTarget - soloAmt);
+
+        float agTarget = agGain;                           // hold during silence and while soloing
         if (! autoGainOn)
             agTarget = 1.0f;
-        else if (msDry > 1.0e-8f && msWet > 1.0e-10f)
+        else if (soloTarget < 0.5f && msDry > 1.0e-8f && msWet > 1.0e-10f)
             agTarget = juce::jlimit (0.063f, 4.0f, std::sqrt (msDry / msWet));   // -24 .. +12 dB
         agGain += agCoef * (agTarget - agGain);
 
-        const float mix = mixSm.getNextValue();
+        const float mixKnob = mixSm.getNextValue();
+        const float mix = mixKnob + soloAmt * (1.0f - mixKnob);   // soloing always lets you hear the band itself
         const float out = outSm.getNextValue();
         const float byp = bypassSm.getNextValue();
 
